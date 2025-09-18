@@ -1,0 +1,20 @@
+[package]
+name = "LoadExc_client"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+
+# LiveKit Rust SDK 与 Server API
+# 版本号请根据你的环境调整；若编译报版本冲突，可临时改为 `*` 或使用 git 依赖。
+livekit = "0.5"
+livekit-api = "0.3"
+
+# GStreamer（后续用于 appsink 管线对接视频帧）
+gstreamer = "0.23"
+gstreamer-app = "0.23"
+gstreamer-video = "0.23"

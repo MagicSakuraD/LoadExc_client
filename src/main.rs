@@ -7,6 +7,12 @@ use livekit::prelude::*;
 use std::env;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
+use dotenvy::dotenv;
+#[cfg(feature = "ros2")]
+use {
+    sensor_msgs::msg::Image as RosImage,
+    std::time::{SystemTime, UNIX_EPOCH},
+};
 
 // 当启用 feature "video" 时，提供一个全局存放 RtcVideoSource 的只写一次容器
 #[cfg(feature = "video")]
@@ -22,6 +28,9 @@ async fn main() -> Result<()> {
         .init();
 
     info!("starting LoadExc_client");
+
+    // 支持 .env 文件（可在项目根目录放置 .env 保存 LIVEKIT_URL/LIVEKIT_TOKEN 等）
+    let _ = dotenv();
 
     // 从环境变量读取 LiveKit 连接参数
     let lk_url = env::var("LIVEKIT_URL").context("LIVEKIT_URL 未设置")?;
@@ -49,19 +58,11 @@ async fn main() -> Result<()> {
     }
 
     // ------------------------------------------------------------------
-    // TODO: 在这里初始化你的 ROS2 订阅器
-    // 示例：在你的 ROS 图像回调中，像这样调用推帧函数：
-    //
-    // let frame_data: Vec<u8> = ...; // 从 ROS msg 获取的 RGBA 数据
-    // let width: u32 = ...;
-    // let height: u32 = ...;
-    // let timestamp_us = ...; // 获取当前时间戳
-    //
-    // tokio::spawn(async move {
-    //     if let Err(e) = push_ros_frame_rgba(&frame_data, width, height, timestamp_us).await {
-    //         warn!("Failed to push frame: {:?}", e);
-    //     }
-    // });
+    // 当启用 feature "ros2" 时，启动 ROS2 订阅器，订阅 /front_camera，收到 RGBA8 图像后推送到 LiveKit
+    #[cfg(feature = "ros2")]
+    {
+        start_ros2_camera_subscription()?;
+    }
     // ------------------------------------------------------------------
 
 
@@ -135,6 +136,64 @@ pub async fn push_ros_frame_rgba(
         .capture_frame(&frame)
         .await
         .context("failed to capture frame")?;
+
+    Ok(())
+}
+
+// ---------------- ROS2 集成（可选 feature: ros2） ----------------
+#[cfg(feature = "ros2")]
+fn start_ros2_camera_subscription() -> Result<()> {
+    use rclrs::{Context, Node, QOS_PROFILE_DEFAULT};
+
+    info!("starting ROS2 subscriber for /front_camera");
+
+    // rclrs 目前采用回调 + spin 的模型，这里在新线程中 spin，不阻塞 tokio 运行时
+    std::thread::spawn(|| {
+        if let Err(e) = (|| -> Result<()> {
+            let context = Context::new(std::env::args()).context("create ROS2 context failed")?;
+            let node = Node::new(&context, "excavator_camera_subscriber").context("create ROS2 node failed")?;
+
+            // 订阅 /front_camera
+            let _sub = node
+                .create_subscription::<RosImage>(
+                    "/front_camera",
+                    QOS_PROFILE_DEFAULT,
+                    |msg: RosImage| {
+                        // 收到图像后，检查编码并尝试推送
+                        if msg.encoding != "rgba8" {
+                            warn!(enc = %msg.encoding, "expect rgba8 encoding; drop frame");
+                            return;
+                        }
+
+                        let timestamp_us = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_micros() as i64)
+                            .unwrap_or(0);
+
+                        let width = msg.width;
+                        let height = msg.height;
+                        let data = msg.data.clone();
+
+                        // 交给 tokio 异步去推送，避免阻塞 rclrs 回调
+                        tokio::spawn(async move {
+                            #[cfg(feature = "video")]
+                            {
+                                if let Err(e) = push_ros_frame_rgba(&data, width, height, timestamp_us).await {
+                                    warn!(?e, "push frame failed");
+                                }
+                            }
+                        });
+                    },
+                )
+                .context("create ROS2 subscription failed")?;
+
+            // 在这个线程里阻塞 spin
+            rclrs::spin(&node).context("spin ROS2 node failed")?;
+            Ok(())
+        })() {
+            error!(?e, "ROS2 subscriber thread exited with error");
+        }
+    });
 
     Ok(())
 }

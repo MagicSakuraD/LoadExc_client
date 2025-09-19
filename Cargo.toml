@@ -14,7 +14,8 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 livekit = "0.5"
 livekit-api = "0.3"
 
-# GStreamer（后续用于 appsink 管线对接视频帧）
-gstreamer = "0.23"
-gstreamer-app = "0.23"
-gstreamer-video = "0.23"
+[features]
+# 启用后尝试创建自定义视频源并发布视频轨（需要你在代码中完善推帧逻辑）
+video = []
+# 预留：启用 ROS2 订阅（需要在代码和依赖中自行接入 rclrs/sensor_msgs）
+ros2 = []

@@ -13,10 +13,8 @@ dotenvy = "0.15"
 # 升级至最新稳定 livekit 以避免老版本依赖冲突
 livekit = "0.7.18"
 
-# 可选 ROS2 依赖（仅在 --features ros2 时构建）
-# 改为 crates.io 发布的 rclrs；暂不引入 sensor_msgs（避免无法解析的包导致构建失败）
-rclrs = { version = "0.5", optional = true }
+# GStreamer 集成（核心、视频、appsrc/appsink）
+gstreamer = { version = "0.23", features = ["v1_18"] }
+gstreamer-video = { version = "0.23", features = ["v1_18"] }
+gstreamer-app = { version = "0.23", features = ["v1_18"] }
 
-[features]
-default = []
-ros2 = ["dep:rclrs"]

@@ -376,52 +376,42 @@ async fn main() -> Result<()> {
     // 优先使用 .env 中的配置（覆盖已存在的环境变量）
     let _ = dotenv_override().ok();
 
-    // 读取 LiveKit 连接参数
-    let lk_url = env::var("LIVEKIT_URL").context("环境变量 LIVEKIT_URL 未设置")?;
+    // 读取 LiveKit 连接参数（默认 ws://localhost:7880，可被环境变量覆盖）
+    let lk_url = env::var("LIVEKIT_URL").unwrap_or_else(|_| "ws://192.168.3.41:7880".to_string());
+    println!("   🔧 LIVEKIT_URL={}", lk_url);
 
-    // 优先使用显式提供的 LIVEKIT_TOKEN；如果没有，则尝试通过 LIVEKIT_TOKEN_ENDPOINT 拉取
-    let lk_token = match env::var("LIVEKIT_TOKEN") {
-        Ok(t) if !t.trim().is_empty() => {
-            println!("   ✅ LIVEKIT_TOKEN: [hidden] (env)");
-            t
-        },
-        _ => {
-            let endpoint = env::var("LIVEKIT_TOKEN_ENDPOINT").unwrap_or_default();
-            if endpoint.is_empty() {
-                anyhow::bail!("环境变量 LIVEKIT_TOKEN 未设置，且未提供 LIVEKIT_TOKEN_ENDPOINT")
-            }
+    // 仅支持动态签发：必须提供 LIVEKIT_TOKEN_ENDPOINT
+    let endpoint = env::var("LIVEKIT_TOKEN_ENDPOINT").unwrap_or_default();
+    if endpoint.is_empty() {
+        anyhow::bail!("仅支持动态签发：请设置 LIVEKIT_TOKEN_ENDPOINT（例如 http://192.168.3.41:3000/api/token）")
+    }
 
-            // 允许通过环境变量覆盖 room/username
-            let room = env::var("LIVEKIT_ROOM").unwrap_or_else(|_| "default".to_string());
-            let username = env::var("LIVEKIT_USERNAME").unwrap_or_else(|_| whoami::username());
+    // 允许通过环境变量覆盖 room/username
+    let room = env::var("LIVEKIT_ROOM").unwrap_or_else(|_| "excavator-control-room".to_string());
+    let username = env::var("LIVEKIT_USERNAME").unwrap_or_else(|_| "heavyMachRemoteTerm".to_string());
 
-            println!("   🌐 正在从 LIVEKIT_TOKEN_ENDPOINT 获取动态 Token...\n       endpoint={} room={} username={}", endpoint, room, username);
+    println!("   🌐 正在从 LIVEKIT_TOKEN_ENDPOINT 获取动态 Token...\n       endpoint={} room={} username={}", endpoint, room, username);
 
-            // 支持简单 GET ?room=..&username=..（对接您给的 Next.js 端点）
-            let url = format!("{}?room={}&username={}", endpoint, urlencoding::encode(&room), urlencoding::encode(&username));
-            let client = reqwest::Client::new();
-            let resp = client
-                .get(&url)
-                .header("Accept", "application/json")
-                .send()
-                .await
-                .context("请求 LIVEKIT_TOKEN_ENDPOINT 失败")?;
+    // GET ?room=..&username=..（对接 Next.js 端点）
+    let url = format!("{}?room={}&username={}", endpoint, urlencoding::encode(&room), urlencoding::encode(&username));
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(&url)
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .context("请求 LIVEKIT_TOKEN_ENDPOINT 失败")?;
 
-            if !resp.status().is_success() {
-                anyhow::bail!(format!("LIVEKIT_TOKEN_ENDPOINT 返回非 2xx: {}", resp.status()));
-            }
+    if !resp.status().is_success() {
+        anyhow::bail!(format!("LIVEKIT_TOKEN_ENDPOINT 返回非 2xx: {}", resp.status()));
+    }
 
-            let json: serde_json::Value = resp.json().await.context("解析 token JSON 失败")?;
-            let token = json.get("token").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            if token.is_empty() {
-                anyhow::bail!("LIVEKIT_TOKEN_ENDPOINT 未返回 token 字段")
-            }
-            println!("   ✅ LIVEKIT_TOKEN: [hidden] (fetched)");
-            token
-        }
-    };
-
-    println!("   ✅ LIVEKIT_URL: {}", lk_url);
+    let json: serde_json::Value = resp.json().await.context("解析 token JSON 失败")?;
+    let lk_token = json.get("token").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if lk_token.is_empty() {
+        anyhow::bail!("LIVEKIT_TOKEN_ENDPOINT 未返回 token 字段")
+    }
+    println!("   ✅ LIVEKIT_TOKEN: [hidden] (fetched)");
 
     // --- LiveKit 连接和轨道创建 ---
     println!("🔗 正在连接到 LiveKit 房间...");

@@ -1,27 +1,31 @@
 // main.rs
 
-use anyhow::{anyhow, Context, Result};
-use dotenvy::dotenv;
+use anyhow::{Context, Result};
+use dotenvy::dotenv_override;
 use livekit::prelude::*;
-use livekit::options::TrackPublishOptions;
+use livekit::options::{TrackPublishOptions, VideoEncoding};
 use livekit::webrtc::video_frame::{VideoFrame, VideoRotation, I420Buffer};
 use livekit::webrtc::video_source::{RtcVideoSource, native::NativeVideoSource};
 use std::env;
-use std::path::Path;
 use std::sync::Arc;
+use std::sync::mpsc as std_mpsc;
 use tokio::sync::mpsc;
-use tracing::{info, warn, error};
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
+use serde_json::Value;
+use reqwest;
 
-// GStreamer crates
-use gstreamer as gst;
-use gstreamer::prelude::*; // Trait extensions for GStreamer elements
-use gstreamer_app as gst_app;
-use gstreamer_app::prelude::*; // Trait extensions for AppSink
-use gstreamer_video as gst_video;
+// ROS2 crates
+use rclrs;
+use rclrs::{CreateBasicExecutor, RclrsErrorFilter};
+use sensor_msgs::msg::Image as RosImage;
+use std_msgs::msg::String as RosString;
 
 // 全局视频源，用于从 GStreamer 线程安全地推送视频帧
 static GLOBAL_VIDEO_SOURCE: std::sync::OnceLock<Arc<RtcVideoSource>> = std::sync::OnceLock::new();
+
+// 全局控制状态，用于合并 gear 和 analog 消息
+static GLOBAL_CONTROL_STATE: std::sync::OnceLock<std::sync::Mutex<UnifiedControlMessage>> = std::sync::OnceLock::new();
 
 // 定义一个统一的帧消息，以便未来扩展（例如，如果也需要处理 RGBA）
 enum FrameMsg {
@@ -35,133 +39,282 @@ enum FrameMsg {
     },
 }
 
-/// 设置并启动 GStreamer 管道
-/// 这个函数会处理所有 GStreamer 相关的初始化工作
-fn setup_gstreamer_pipeline(tx: mpsc::Sender<FrameMsg>) -> Result<gst::Pipeline> {
-    println!("🎬 启动 GStreamer 文件解码...");
-    gst::init().context("Failed to initialize GStreamer")?;
+/// 控制消息（从 LiveKit DataChannel 转 ROS2，统一处理所有类型）
+enum ControlMsg {
+    Data {
+        data: Arc<Vec<u8>>,
+        reliable: bool,
+    },
+}
 
-    let video_path = env::var("VIDEO_FILE").unwrap_or_else(|_| "video/test.mp4".to_string());
-    println!("   📄 输入文件: {}", &video_path);
-    if !Path::new(&video_path).exists() {
-        anyhow::bail!("❌ 输入文件不存在，请检查 VIDEO_FILE 路径: {}", video_path);
-    }
+/// 统一控制消息结构（合并 gear 和 analog）
+#[derive(serde::Serialize, serde::Deserialize)]
+struct UnifiedControlMessage {
+    // 装载机专用控制
+    rotation: f64,     // 方向盘旋转: -1 (左) to 1 (右)
+    brake: f64,        // 刹车: 0 (松开) to 1 (踩死)
+    throttle: f64,     // 油门: 0 (松开) to 1 (踩死)
+    gear: String,      // 档位: 'P' | 'R' | 'N' | 'D'
     
-    let loop_video = env::var("LOOP_VIDEO").unwrap_or_else(|_| "true".to_string()).parse::<bool>().unwrap_or(true);
-    println!("   🔄 循环播放: {}", if loop_video { "启用" } else { "禁用" });
-
-    // 构建 GStreamer 管道描述字符串
-    // filesrc -> decodebin -> videoconvert -> video/x-raw,format=I420 -> appsink
-    let fps: u32 = env::var("VIDEO_FPS").ok().and_then(|v| v.parse().ok()).unwrap_or(30);
-    let pipeline_desc = format!(
-        "filesrc location=\"{}\" ! decodebin ! videoconvert ! videorate ! video/x-raw,format=I420,framerate={}/1 ! appsink name=sink emit-signals=true sync=true max-buffers=2 drop=true",
-        video_path, fps
-    );
-    println!("   ⚙️  GStreamer Pipeline: {}", pipeline_desc);
-
-    let pipeline = gst::parse::launch(&pipeline_desc)
-        .context("Failed to build GStreamer pipeline from description")?;
+    // 共用控制
+    boom: f64,         // 大臂: -1 (降) to 1 (提)
+    bucket: f64,       // 铲斗: -1 (收) to 1 (翻)
     
-    let pipeline = pipeline
-        .dynamic_cast::<gst::Pipeline>()
-        .map_err(|_| anyhow!("Failed to cast GstElement to GstPipeline"))?;
+    // 兼容性属性（设为默认值）
+    left_track: f64,   // 左履带: -1 (后) to 1 (前)
+    right_track: f64,  // 右履带: -1 (后) to 1 (前)
+    swing: f64,        // 驾驶室旋转: -1 (左) to 1 (右)
+    stick: f64,        // 小臂: -1 (收) to 1 (伸)
+    
+    // 设备类型标识
+    device_type: String, // 设备类型
+    timestamp: i64,    // 时间戳
+}
 
-    let sink = pipeline
-        .by_name("sink")
-        .ok_or_else(|| anyhow!("Could not find element 'sink' in the pipeline"))?
-        .dynamic_cast::<gst_app::AppSink>()
-        .map_err(|_| anyhow!("Sink element is not an AppSink"))?;
+// 仅保留 ROS2 订阅路径（无 GStreamer 路径）
 
-    // 设置 AppSink 的属性与回调函数，当有新帧可用时，GStreamer 会调用这个闭包
-    sink.set_property("sync", &true);
-    sink.set_callbacks(
-        gst_app::AppSinkCallbacks::builder()
-            .new_sample(move |appsink| {
-                let sample = appsink.pull_sample().map_err(|_| {
-                    warn!("Could not pull sample from appsink");
-                    gst::FlowError::Eos
-                })?;
+fn start_ros2_image_subscriber(tx: mpsc::Sender<FrameMsg>, topic: String) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        // 基于当前 rclrs 版本的推荐写法：Context -> Executor -> Node -> Subscription -> spin
+        let mut executor = match rclrs::Context::default_from_env() {
+            Ok(ctx) => ctx.create_basic_executor(),
+            Err(e) => {
+                eprintln!("ROS2 Context init failed: {:?}", e);
+                return;
+            }
+        };
+        let node = match executor.create_node("lk_ros_client") {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("ROS2 Node create failed: {:?}", e);
+                return;
+            }
+        };
+        let tx_sub = tx.clone();
+        let _subscription = match node.create_subscription::<RosImage, _>(&topic, move |msg: RosImage| {
+            let width = msg.width;
+            let height = msg.height;
+            let step = msg.step;
+            let enc = msg.encoding.to_lowercase();
+            let data_len = msg.data.len();
 
-                let buffer = sample.buffer().ok_or_else(|| {
-                    warn!("GStreamer sample did not contain a buffer");
-                    gst::FlowError::Error
-                })?;
-                
-                let info = sample.caps()
-                    .and_then(|c| gst_video::VideoInfo::from_caps(c).ok())
-                    .ok_or_else(|| {
-                        warn!("GStreamer sample caps did not contain video info");
-                        gst::FlowError::Error
-                    })?;
+            if enc != "i420" {
+                println!(
+                    "⚠️  收到非 I420 编码: enc='{}' (len={}), w={}, h={}, step={}",
+                    msg.encoding, data_len, width, height, step
+                );
+                return;
+            }
 
-                // 从 buffer 中提取 I420 的 Y, U, V 三个平面
-                let map = gst_video::VideoFrameRef::from_buffer_ref_readable(buffer, &info)
-                    .map_err(|_| {
-                        warn!("Failed to map GStreamer buffer as video frame");
-                        gst::FlowError::Error
-                    })?;
-                
-                let y = map.plane_data(0).unwrap_or_default().to_vec();
-                let u = map.plane_data(1).unwrap_or_default().to_vec();
-                let v = map.plane_data(2).unwrap_or_default().to_vec();
-                
-                // 使用系统时间作为时间戳，保证按实时节奏推送
-                let ts_us = {
-                    use std::time::{SystemTime, UNIX_EPOCH};
-                    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-                    now.as_micros() as i64
-                };
+            let y_size = (width as usize) * (height as usize);
+            let uv_plane = (width as usize * height as usize) / 4;
+            let expected = y_size + 2 * uv_plane;
 
-                // 通过通道将帧数据发送到主 Tokio 循环
-                let _ = tx.try_send(FrameMsg::I420 {
-                    y, u, v,
-                    width: info.width(),
-                    height: info.height(),
-                    ts_us,
-                });
+            if data_len < expected {
+                println!(
+                    "⚠️  I420 数据长度不足: got={}, expected={} (w={}, h={}, step={})",
+                    data_len, expected, width, height, step
+                );
+                return;
+            }
 
-                Ok(gst::FlowSuccess::Ok)
-            })
-            .build(),
-    );
+            if step != width {
+                println!(
+                    "⚠️  发现 stride(每行步长) 与 width 不一致: step={} != width={}，需按行拷贝平面。",
+                    step, width
+                );
+            }
 
-    // 【重要】设置 GStreamer 消息总线监听，以实现健壮的循环播放
-    if loop_video {
-        let bus = pipeline.bus().context("Failed to get pipeline bus")?;
-        let pipeline_weak = pipeline.downgrade(); // 使用弱引用以避免循环引用
+            let y = msg.data[0..y_size].to_vec();
+            let u = msg.data[y_size..y_size + uv_plane].to_vec();
+            let v = msg.data[y_size + uv_plane..expected].to_vec();
+            let ts_us = (msg.header.stamp.sec as i64) * 1_000_000 + (msg.header.stamp.nanosec as i64) / 1_000;
 
-        // 在一个单独的线程中监听总线消息，不会阻塞主循环
-        std::thread::spawn(move || {
-            for msg in bus.iter_timed(gst::ClockTime::NONE) {
-                // 仅在 pipeline 仍然存在时处理消息
-                if let Some(pipeline) = pipeline_weak.upgrade() {
-                    match msg.view() {
-                        // 当收到 EOS (End-of-Stream) 消息时...
-                        gst::MessageView::Eos(_) => {
-                            info!("GStreamer EOS received, seeking to beginning for loop.");
-                            // 将播放位置重置到开头，实现无缝循环
-                            if let Err(e) = pipeline.seek_simple(gst::SeekFlags::FLUSH, gst::ClockTime::ZERO) {
-                                warn!("Failed to seek pipeline to the beginning: {:?}", e);
-                            }
+            // 视频帧日志过多，开发阶段关闭此高频打印，如需调试可启用
+
+            if let Err(e) = tx_sub.try_send(FrameMsg::I420 { y, u, v, width, height, ts_us }) {
+                println!("⚠️  发送到通道失败(满?): {:?}", e);
+            }
+        }) {
+            Ok(s) => {
+                println!("✅ ROS2 订阅已创建: topic='{}'", topic);
+                s
+            },
+            Err(e) => {
+                eprintln!("ROS2 Subscription create failed: {:?}", e);
+                return;
+            }
+        };
+
+        println!("🔄 即将进入 ROS2 spin()");
+        let errs = executor.spin(rclrs::SpinOptions::default());
+        if let Err(e) = errs.first_error() {
+            eprintln!("ROS2 spin failed: {:?}", e);
+        }
+    })
+}
+
+/// 启动 ROS2 控制话题发布线程（统一处理所有控制消息）
+fn start_ros2_controls_publisher(
+    rx: std_mpsc::Receiver<ControlMsg>,
+    control_topic: String,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        // 初始化 ROS2 上下文与节点
+        let executor = match rclrs::Context::default_from_env() {
+            Ok(ctx) => ctx.create_basic_executor(),
+            Err(e) => {
+                eprintln!("ROS2 Context init failed (controls): {:?}", e);
+                return;
+            }
+        };
+        let node = match executor.create_node("lk_ros_controls_bridge") {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("ROS2 Node create failed (controls): {:?}", e);
+                return;
+            }
+        };
+
+        // 创建统一控制发布者
+        let pub_control = match node.create_publisher::<RosString>(&control_topic) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("Create publisher '{}' failed: {:?}", control_topic, e);
+                return;
+            }
+        };
+
+        println!("✅ ROS2 控制发布器已创建: '{}'", control_topic);
+
+        // 不需要持续 spin 发布，也可偶尔 spin 一下处理内部事件
+        loop {
+            match rx.recv() {
+                Ok(ControlMsg::Data { data, reliable }) => {
+                    let payload = match String::from_utf8(data.as_ref().clone()) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("⚠️  控制消息非 UTF-8，丢弃: {:?}", e);
+                            continue;
                         }
-                        gst::MessageView::Error(err) => {
-                            error!(
-                                "Error from GStreamer pipeline: {}, debug: {}",
-                                err.error(),
-                                err.debug().unwrap_or_else(|| "No debug info".into())
-                            );
-                            break; // 出现错误时退出监听线程
+                    };
+
+                    // 解析并合并控制消息
+                    if let Ok(unified_msg) = parse_and_merge_control_message(&payload) {
+                        // 统一处理所有控制消息，不区分类型
+                        if payload.len() <= 512 {
+                            println!("🎮 统一控制消息: reliable={} data={}", reliable, payload);
+                        } else {
+                            println!("🎮 统一控制消息: reliable={} data_len={}", reliable, payload.len());
                         }
-                        _ => {}
+
+                        let mut msg = RosString::default();
+                        msg.data = serde_json::to_string(&unified_msg).unwrap_or_else(|_| payload);
+                        if let Err(e) = pub_control.publish(msg) {
+                            eprintln!("⚠️  发布 '{}' 失败: {:?}", control_topic, e);
+                        }
+                    } else {
+                        eprintln!("⚠️  解析控制消息失败，丢弃: {}", payload);
                     }
-                } else {
-                    break; // 如果 pipeline 被销毁，则退出线程
+                }
+                Err(_) => {
+                    println!("🛑 控制通道已关闭，结束 ROS2 控制发布线程");
+                    break;
                 }
             }
-        });
-    }
+            // 让出执行权，避免忙等
+            std::thread::yield_now();
+        }
+    })
+}
 
-    Ok(pipeline)
+/// 解析并合并控制消息（gear 和 analog）
+fn parse_and_merge_control_message(payload: &str) -> Result<UnifiedControlMessage, Box<dyn std::error::Error>> {
+    let json: Value = serde_json::from_str(payload)?;
+    
+    // 获取全局控制状态
+    let state = GLOBAL_CONTROL_STATE.get_or_init(|| {
+        std::sync::Mutex::new(UnifiedControlMessage {
+            rotation: 0.0,
+            brake: 0.0,
+            throttle: 0.0,
+            gear: "N".to_string(),
+            boom: 0.0,
+            bucket: 0.0,
+            left_track: 0.0,
+            right_track: 0.0,
+            swing: 0.0,
+            stick: 0.0,
+            device_type: "wheel_loader".to_string(),
+            timestamp: 0,
+        })
+    });
+    
+    let mut current_state = state.lock().unwrap();
+    
+    // 更新时间戳
+    if let Some(t) = json.get("t").and_then(|v| v.as_i64()) {
+        current_state.timestamp = t;
+    }
+    
+    // 根据消息类型更新相应字段
+    if let Some(msg_type) = json.get("type").and_then(|v| v.as_str()) {
+        match msg_type {
+            "gear" => {
+                if let Some(gear) = json.get("gear").and_then(|v| v.as_str()) {
+                    current_state.gear = gear.to_string();
+                }
+            }
+            "analog" => {
+                if let Some(v_obj) = json.get("v") {
+                    if let Some(rotation) = v_obj.get("rotation").and_then(|v| v.as_f64()) {
+                        current_state.rotation = rotation;
+                    }
+                    if let Some(brake) = v_obj.get("brake").and_then(|v| v.as_f64()) {
+                        current_state.brake = brake;
+                    }
+                    if let Some(throttle) = v_obj.get("throttle").and_then(|v| v.as_f64()) {
+                        current_state.throttle = throttle;
+                    }
+                    if let Some(boom) = v_obj.get("boom").and_then(|v| v.as_f64()) {
+                        current_state.boom = boom;
+                    }
+                    if let Some(bucket) = v_obj.get("bucket").and_then(|v| v.as_f64()) {
+                        current_state.bucket = bucket;
+                    }
+                    if let Some(left_track) = v_obj.get("leftTrack").and_then(|v| v.as_f64()) {
+                        current_state.left_track = left_track;
+                    }
+                    if let Some(right_track) = v_obj.get("rightTrack").and_then(|v| v.as_f64()) {
+                        current_state.right_track = right_track;
+                    }
+                    if let Some(swing) = v_obj.get("swing").and_then(|v| v.as_f64()) {
+                        current_state.swing = swing;
+                    }
+                    if let Some(stick) = v_obj.get("stick").and_then(|v| v.as_f64()) {
+                        current_state.stick = stick;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    
+    // 返回当前状态的副本
+    Ok(UnifiedControlMessage {
+        rotation: current_state.rotation,
+        brake: current_state.brake,
+        throttle: current_state.throttle,
+        gear: current_state.gear.clone(),
+        boom: current_state.boom,
+        bucket: current_state.bucket,
+        left_track: current_state.left_track,
+        right_track: current_state.right_track,
+        swing: current_state.swing,
+        stick: current_state.stick,
+        device_type: current_state.device_type.clone(),
+        timestamp: current_state.timestamp,
+    })
 }
 
 /// 将已是 I420 格式的帧平面数据推送到 LiveKit
@@ -187,7 +340,10 @@ async fn push_i420_planes(
         u_data.copy_from_slice(u_plane);
         v_data.copy_from_slice(v_plane);
     } else {
-        warn!("Plane data size mismatch, dropping frame");
+        println!(
+            "⚠️  平面尺寸不匹配，丢弃帧: dst(Y,U,V)=({},{},{}), src(Y,U,V)=({},{},{}) w={}, h={}",
+            y_data.len(), u_data.len(), v_data.len(), y_plane.len(), u_plane.len(), v_plane.len(), width, height
+        );
         return Ok(());
     }
 
@@ -218,14 +374,54 @@ async fn main() -> Result<()> {
     println!("📋 环境变量检查:");
 
     // 优先使用 .env 中的配置（覆盖已存在的环境变量）
-    let _ = dotenvy::dotenv_override().ok();
+    let _ = dotenv_override().ok();
 
     // 读取 LiveKit 连接参数
     let lk_url = env::var("LIVEKIT_URL").context("环境变量 LIVEKIT_URL 未设置")?;
-    let lk_token = env::var("LIVEKIT_TOKEN").context("环境变量 LIVEKIT_TOKEN 未设置")?;
+
+    // 优先使用显式提供的 LIVEKIT_TOKEN；如果没有，则尝试通过 LIVEKIT_TOKEN_ENDPOINT 拉取
+    let lk_token = match env::var("LIVEKIT_TOKEN") {
+        Ok(t) if !t.trim().is_empty() => {
+            println!("   ✅ LIVEKIT_TOKEN: [hidden] (env)");
+            t
+        },
+        _ => {
+            let endpoint = env::var("LIVEKIT_TOKEN_ENDPOINT").unwrap_or_default();
+            if endpoint.is_empty() {
+                anyhow::bail!("环境变量 LIVEKIT_TOKEN 未设置，且未提供 LIVEKIT_TOKEN_ENDPOINT")
+            }
+
+            // 允许通过环境变量覆盖 room/username
+            let room = env::var("LIVEKIT_ROOM").unwrap_or_else(|_| "default".to_string());
+            let username = env::var("LIVEKIT_USERNAME").unwrap_or_else(|_| whoami::username());
+
+            println!("   🌐 正在从 LIVEKIT_TOKEN_ENDPOINT 获取动态 Token...\n       endpoint={} room={} username={}", endpoint, room, username);
+
+            // 支持简单 GET ?room=..&username=..（对接您给的 Next.js 端点）
+            let url = format!("{}?room={}&username={}", endpoint, urlencoding::encode(&room), urlencoding::encode(&username));
+            let client = reqwest::Client::new();
+            let resp = client
+                .get(&url)
+                .header("Accept", "application/json")
+                .send()
+                .await
+                .context("请求 LIVEKIT_TOKEN_ENDPOINT 失败")?;
+
+            if !resp.status().is_success() {
+                anyhow::bail!(format!("LIVEKIT_TOKEN_ENDPOINT 返回非 2xx: {}", resp.status()));
+            }
+
+            let json: serde_json::Value = resp.json().await.context("解析 token JSON 失败")?;
+            let token = json.get("token").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if token.is_empty() {
+                anyhow::bail!("LIVEKIT_TOKEN_ENDPOINT 未返回 token 字段")
+            }
+            println!("   ✅ LIVEKIT_TOKEN: [hidden] (fetched)");
+            token
+        }
+    };
 
     println!("   ✅ LIVEKIT_URL: {}", lk_url);
-    println!("   ✅ LIVEKIT_TOKEN: [hidden]");
 
     // --- LiveKit 连接和轨道创建 ---
     println!("🔗 正在连接到 LiveKit 房间...");
@@ -236,7 +432,7 @@ async fn main() -> Result<()> {
     println!("   ✅ 成功连接到房间: '{}'", room.name());
 
     println!("🎥 创建并发布视频轨道...");
-    let track_name = env::var("VIDEO_TRACK_NAME").unwrap_or_else(|_| "gstreamer_feed".to_string());
+    let track_name = env::var("VIDEO_TRACK_NAME").unwrap_or_else(|_| "ros_camera_feed".to_string());
     let native_source = NativeVideoSource::default();
     let source = RtcVideoSource::Native(native_source);
     let local_track = LocalVideoTrack::create_video_track(&track_name, source.clone());
@@ -244,7 +440,15 @@ async fn main() -> Result<()> {
     room.local_participant()
         .publish_track(
             LocalTrack::Video(local_track.clone()),
-            TrackPublishOptions { source: TrackSource::Camera, ..Default::default() }
+            TrackPublishOptions { 
+                source: TrackSource::Camera, 
+                simulcast: true,  // 启用simulcast多分辨率流
+                video_encoding: Some(VideoEncoding {
+                    max_bitrate: 2_000_000,  // 2Mbps最大码率
+                    max_framerate: 30.0,     // 30fps最大帧率
+                }),
+                ..Default::default() 
+            }
         )
         .await
         .context("发布视频轨道失败")?;
@@ -253,42 +457,45 @@ async fn main() -> Result<()> {
     println!("   ✅ 视频轨道 '{}' 发布成功", track_name);
     let _ = GLOBAL_VIDEO_SOURCE.set(Arc::new(source));
 
-    // --- GStreamer 设置 ---
-    let (tx, mut rx) = mpsc::channel::<FrameMsg>(4); // 创建通道，容量为 4
-    let pipeline = setup_gstreamer_pipeline(tx)?;
+    // --- 仅 ROS2 视频源 ---
+    let (tx, mut rx) = mpsc::channel::<FrameMsg>(8);
+    let topic = std::env::var("ROS_IMAGE_TOPIC").unwrap_or_else(|_| "/camera_front_wide".to_string());
+    println!("🛰️  使用 ROS2 图像话题: {}", topic);
+    let _handle = start_ros2_image_subscriber(tx, topic);
 
-    // 启动 GStreamer 管道
-    pipeline.set_state(gst::State::Playing)
-        .context("无法将 GStreamer 管道设置为 Playing 状态")?;
-    println!("   ✅ GStreamer 管道已启动");
+    // --- ROS2 控制发布器（接收 LiveKit DataChannel -> 统一发布到 ROS2 话题） ---
+    let (ctl_tx, ctl_rx) = std_mpsc::channel::<ControlMsg>();
+    let ros_control_topic = std::env::var("ROS_CONTROL_TOPIC").unwrap_or_else(|_| "/controls/teleop".to_string());
+    let _ctl_handle = start_ros2_controls_publisher(ctl_rx, ros_control_topic.clone());
 
 
     // --- 主事件循环 ---
     println!("🔄 进入主事件循环 (按 Ctrl+C 停止)");
-    let mut frame_count = 0;
     loop {
         tokio::select! {
             // 监听 LiveKit 房间事件
             Some(event) = room_events.recv() => {
                 info!(?event, "Received room event");
-                if let RoomEvent::Disconnected { .. } = event {
-                    println!("   ❌ 房间连接已断开，程序即将退出。");
-                    break;
+                match event {
+                    RoomEvent::Disconnected { .. } => {
+                        println!("   ❌ 房间连接已断开，程序即将退出。");
+                        break;
+                    }
+                    // DataChannel 数据（统一处理所有类型）
+                    RoomEvent::DataReceived { participant: _, payload, topic, kind } => {
+                        let reliable = format!("{:?}", kind).to_lowercase().contains("reliable");
+                        println!("📡 收到数据通道消息: topic={:?}, reliable={}, len={}", topic, reliable, payload.len());
+                        // 统一透传所有控制消息到 ROS2 发布线程
+                        let _ = ctl_tx.send(ControlMsg::Data { data: payload, reliable });
+                    }
+                    _ => {}
                 }
             }
-            // 监听从 GStreamer 传来的新视频帧
+            // 监听从 ROS2 图像订阅来的新视频帧（静默处理，避免刷屏）
             Some(msg) = rx.recv() => {
-                frame_count += 1;
-                match msg {
-                    FrameMsg::I420 { y, u, v, width, height, ts_us } => {
-                        if frame_count % 100 == 0 { // 每 100 帧打印一次日志，避免刷屏
-                             println!("   🎬 正在处理第 {} 帧: {}x{}", frame_count, width, height);
-                        }
-                       
-                        if let Err(e) = push_i420_planes(&y, &u, &v, width, height, ts_us).await {
-                            warn!("Failed to push frame to LiveKit: {:?}", e);
-                        }
-                    }
+                let FrameMsg::I420 { y, u, v, width, height, ts_us } = msg;
+                if let Err(e) = push_i420_planes(&y, &u, &v, width, height, ts_us).await {
+                    warn!("Failed to push frame to LiveKit: {:?}", e);
                 }
             }
             // 监听 Ctrl+C 信号以优雅地关闭
@@ -302,11 +509,7 @@ async fn main() -> Result<()> {
 
     // --- 优雅地关闭 ---
     println!("🔄 正在关闭连接和管道...");
-    
-    // 停止 GStreamer 管道
-    if let Err(e) = pipeline.set_state(gst::State::Null) {
-        warn!("Failed to set pipeline to Null state: {}", e);
-    }
+    // 无 GStreamer 管道
     
     // 关闭 LiveKit 房间连接
     room.close().await?;

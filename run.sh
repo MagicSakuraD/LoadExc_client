@@ -26,21 +26,28 @@ if [ -f ./.env ]; then
   else
     echo "   LIVEKIT_TOKEN_LEN=0"
   fi
-  echo "   VIDEO_FILE=${VIDEO_FILE:-video/test.mp4}"
-  echo "   LOOP_VIDEO=${LOOP_VIDEO:-true}"
-  echo "   VIDEO_FPS=${VIDEO_FPS:-30}"
+  echo "   ROS_IMAGE_TOPIC=${ROS_IMAGE_TOPIC:-/camera_front_wide}"
+  echo "   VIDEO_TRACK_NAME=${VIDEO_TRACK_NAME:-ros_camera_feed}"
 fi
 
-# 2.1) 若未设置 VIDEO_FILE，则设置为你的默认视频路径
-if [ -z "${VIDEO_FILE:-}" ]; then
-  export VIDEO_FILE="/home/cyber-v2x/Code/RustCode/LoadExc_client/video/test.mp4"
+# 2.1) source ROS 与工作区环境（若存在）
+if [ -f /opt/ros/humble/setup.sh ]; then
+  # shellcheck disable=SC1091
+  set +u
+  . /opt/ros/humble/setup.sh
+  set -u
+fi
+if [ -f "$HOME/rust_ws/install/setup.sh" ]; then
+  # shellcheck disable=SC1091
+  set +u
+  . "$HOME/rust_ws/install/setup.sh"
+  set -u
 fi
 
-# 2.2) 若未设置 LOOP_VIDEO/VIDEO_FPS，给出默认值
-export LOOP_VIDEO="${LOOP_VIDEO:-true}"
-export VIDEO_FPS="${VIDEO_FPS:-30}"
+# 3) 构建并运行（ROS2-only）
+export ROS_IMAGE_TOPIC="${ROS_IMAGE_TOPIC:-/camera_front_wide}"
 
-# 3) 构建并运行
+echo "🛠️  构建 (ROS2-only)"
 cargo build
 cargo run "$@"
 

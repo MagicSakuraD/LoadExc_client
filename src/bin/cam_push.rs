@@ -7,11 +7,13 @@ use livekit::webrtc::video_source::native::NativeVideoSource;
 use livekit::webrtc::video_source::RtcVideoSource;
 use std::sync::Arc;
 use tokio::time::{self, Duration, Instant};
+use chrono::Local;
 use v4l::buffer::Type;
 use v4l::io::mmap::Stream as MmapStream;
 use v4l::io::traits::CaptureStream;
 use v4l::prelude::*;
 use v4l::video::Capture as _;
+use sdl2::{pixels::PixelFormatEnum, rect::Rect};
 
 fn yuyv_to_i420_planes(src: &[u8], width: usize, height: usize) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
     // YUYV 4:2:2 每 2 像素 4 字节: Y0 U Y1 V
@@ -59,6 +61,73 @@ fn yuyv_to_i420_planes(src: &[u8], width: usize, height: usize) -> Result<(Vec<u
     Ok((y, u, v))
 }
 
+// 5x7 简易字体（每个字符 5 列、7 行，bit1 表示填充）
+const FONT_5X7: [[u8; 7]; 12] = [
+    // '0'..'9', ':', '.'
+    [0b01110,0b10001,0b10011,0b10101,0b11001,0b10001,0b01110], // 0
+    [0b00100,0b01100,0b00100,0b00100,0b00100,0b00100,0b01110], // 1
+    [0b01110,0b10001,0b00001,0b00010,0b00100,0b01000,0b11111], // 2
+    [0b11110,0b00001,0b00001,0b00110,0b00001,0b00001,0b11110], // 3
+    [0b00010,0b00110,0b01010,0b10010,0b11111,0b00010,0b00010], // 4
+    [0b11111,0b10000,0b11110,0b00001,0b00001,0b10001,0b01110], // 5
+    [0b00110,0b01000,0b10000,0b11110,0b10001,0b10001,0b01110], // 6
+    [0b11111,0b00001,0b00010,0b00100,0b01000,0b01000,0b01000], // 7
+    [0b01110,0b10001,0b10001,0b01110,0b10001,0b10001,0b01110], // 8
+    [0b01110,0b10001,0b10001,0b01111,0b00001,0b00010,0b01100], // 9
+    [0b00000,0b00100,0b00100,0b00000,0b00100,0b00100,0b00000], // ':'
+    [0b00000,0b00000,0b00000,0b00000,0b00000,0b00100,0b00000], // '.'
+];
+
+fn glyph_index(ch: char) -> Option<usize> {
+    match ch {
+        '0'..='9' => Some((ch as u8 - b'0') as usize),
+        ':' => Some(10),
+        '.' => Some(11),
+        _ => None,
+    }
+}
+
+fn draw_text_i420(y: &mut [u8], u: &mut [u8], v: &mut [u8], width: usize, height: usize, x0: usize, y0: usize, scale: usize, text: &str) {
+    let y_white: u8 = 235; // 白色亮度
+    let u_neutral: u8 = 128; // 中性色度
+    let v_neutral: u8 = 128;
+    let glyph_w = 5usize;
+    let glyph_h = 7usize;
+    let gap = 1usize; // 字符间距
+
+    let mut cx = x0;
+    for ch in text.chars() {
+        if let Some(idx) = glyph_index(ch) {
+            for gy in 0..glyph_h {
+                if y0 + gy >= height { continue; }
+                let row = FONT_5X7[idx][gy];
+                for gx in 0..glyph_w {
+                    if cx + gx >= width { continue; }
+                    let bit = (row >> (glyph_w - 1 - gx)) & 1;
+                    if bit == 1 {
+                        // 放大绘制 scale x scale
+                        for sy in 0..scale {
+                            for sx in 0..scale {
+                                let py = y0 + gy * scale + sy;
+                                let px = cx + gx * scale + sx;
+                                if py >= height || px >= width { continue; }
+                                y[py * width + px] = y_white;
+                                let uvi = (py / 2) * (width / 2) + (px / 2);
+                                if uvi < u.len() { u[uvi] = u_neutral; }
+                                if uvi < v.len() { v[uvi] = v_neutral; }
+                            }
+                        }
+                    }
+                }
+            }
+            cx += (glyph_w + gap) * scale;
+        } else {
+            cx += (glyph_w + gap) * scale; // 未知字符占位
+        }
+        if cx >= width { break; }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // 环境变量
@@ -100,15 +169,18 @@ async fn main() -> Result<()> {
     let cam_index: usize = std::env::var("CAM_INDEX").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
     let mut dev = Device::new(cam_index).context("打开摄像头失败")?;
 
-    // 配置分辨率/帧率与像素格式 YUYV
+    // 配置分辨率/帧率与像素格式（默认 YUYV，可通过 CAM_FOURCC 覆盖）
     let width: u32 = std::env::var("CAM_WIDTH").ok().and_then(|s| s.parse().ok()).unwrap_or(1280);
     let height: u32 = std::env::var("CAM_HEIGHT").ok().and_then(|s| s.parse().ok()).unwrap_or(720);
     let fps: u32 = std::env::var("CAM_FPS").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
+    let fourcc_str = std::env::var("CAM_FOURCC").unwrap_or_else(|_| "YUYV".to_string());
+    let mut fourcc_bytes = [0u8; 4];
+    for (i, b) in fourcc_str.bytes().take(4).enumerate() { fourcc_bytes[i] = b; }
 
     let mut fmt = dev.format()?;
     fmt.width = width;
     fmt.height = height;
-    fmt.fourcc = v4l::FourCC::new(b"YUYV");
+    fmt.fourcc = v4l::FourCC::new(&fourcc_bytes);
     let fmt = dev.set_format(&fmt).context("设置摄像头格式失败")?;
 
     let _params = dev.params()?; // 某些平台无法程序化设置 fps，这里沿用当前设置
@@ -121,6 +193,36 @@ async fn main() -> Result<()> {
     let mut ticker = time::interval(frame_interval);
     ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
 
+    // 可选本地预览（SDL2），设置 PREVIEW=1 启用
+    let enable_preview = std::env::var("PREVIEW").ok().map(|v| v == "1" || v.to_lowercase() == "true").unwrap_or(false);
+    let mut _sdl_ctx_opt: Option<sdl2::Sdl> = None;
+    let mut canvas_opt: Option<sdl2::render::Canvas<sdl2::video::Window>> = None;
+    // 我们仅持有 canvas；纹理在每帧内创建并释放，避免生命周期问题
+    if enable_preview {
+        if let Ok(sdl) = sdl2::init() {
+            if let Ok(video) = sdl.video() {
+                if let Ok(window) = video
+                    .window("cam_push preview", width, height)
+                    .position_centered()
+                    .opengl()
+                    .build()
+                {
+                    if let Ok(canvas) = window.into_canvas().accelerated().present_vsync().build() {
+                        // 重要：保持创建顺序与持有顺序：canvas -> texture_creator -> texture
+                        canvas_opt = Some(canvas);
+                        _sdl_ctx_opt = Some(sdl);
+                    } else {
+                        _sdl_ctx_opt = Some(sdl);
+                    }
+                } else {
+                    _sdl_ctx_opt = Some(sdl);
+                }
+            } else {
+                _sdl_ctx_opt = Some(sdl);
+            }
+        }
+    }
+
     loop {
         ticker.tick().await;
         let (buf, _meta) = match stream.next() {
@@ -128,9 +230,89 @@ async fn main() -> Result<()> {
             Err(_) => continue,
         };
 
-        let (y, u, v) = yuyv_to_i420_planes(buf, fmt.width as usize, fmt.height as usize)?;
+        // 根据实际 fourcc 处理: 支持 YUYV 和 MJPG
+        let (mut y, mut u, mut v) = if fmt.fourcc == v4l::FourCC::new(b"YUYV") {
+            yuyv_to_i420_planes(buf, fmt.width as usize, fmt.height as usize)?
+        } else if fmt.fourcc == v4l::FourCC::new(b"MJPG") {
+            // MJPG: 解码 JPEG 为 RGB，再转换到 I420
+            match jpeg_decoder::Decoder::new(buf).decode() {
+                Ok(rgb) => {
+                    let w_us = fmt.width as usize;
+                    let h_us = fmt.height as usize;
+                    if rgb.len() != w_us * h_us * 3 { continue; }
+                    // RGB -> I420
+                    let mut y = vec![0u8; w_us * h_us];
+                    let mut u = vec![0u8; (w_us/2) * (h_us/2)];
+                    let mut v = vec![0u8; (w_us/2) * (h_us/2)];
+                    for j in (0..h_us).step_by(2) {
+                        for i in (0..w_us).step_by(2) {
+                            let mut u_acc: i32 = 0;
+                            let mut v_acc: i32 = 0;
+                            for dy in 0..2 { for dx in 0..2 {
+                                let x = i + dx; let yj = j + dy;
+                                let idx = (yj*w_us + x) * 3;
+                                let r = rgb[idx] as f32;
+                                let g = rgb[idx+1] as f32;
+                                let b = rgb[idx+2] as f32;
+                                let y_val = (0.257*r + 0.504*g + 0.098*b + 16.0).round() as i32;
+                                y[yj*w_us + x] = y_val.clamp(0,255) as u8;
+                                let u_val = (-0.148*r - 0.291*g + 0.439*b + 128.0).round() as i32;
+                                let v_val = (0.439*r - 0.368*g - 0.071*b + 128.0).round() as i32;
+                                u_acc += u_val; v_acc += v_val;
+                            }}
+                            let uvi = (j/2)*(w_us/2) + (i/2);
+                            u[uvi] = (u_acc/4).clamp(0,255) as u8;
+                            v[uvi] = (v_acc/4).clamp(0,255) as u8;
+                        }
+                    }
+                    (y,u,v)
+                }
+                Err(_) => { continue }
+            }
+        } else {
+            // 其它格式暂不支持
+            continue;
+        };
         let w = fmt.width;
         let h = fmt.height;
+
+        // 叠加时间戳文本（本地时间）
+        let now = Local::now();
+        let ts_text = now.format("%H:%M:%S.%3f").to_string();
+        // 位置与缩放可配置
+        let pos = std::env::var("TIMESTAMP_POS").unwrap_or_else(|_| "tl".to_string()); // tl|tr|bl|br
+        let scale: usize = std::env::var("TIMESTAMP_SCALE").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
+        let margin = 16usize;
+        let text_px_w = (5 + 1) * scale * ts_text.len();
+        let text_px_h = 7 * scale;
+        let (mut x, mut ytop) = (margin, margin);
+        let w_us = w as usize;
+        let h_us = h as usize;
+        match pos.as_str() {
+            "tr" => { x = w_us.saturating_sub(text_px_w + margin); ytop = margin; }
+            "bl" => { x = margin; ytop = h_us.saturating_sub(text_px_h + margin); }
+            "br" => { x = w_us.saturating_sub(text_px_w + margin); ytop = h_us.saturating_sub(text_px_h + margin); }
+            _ => {}
+        }
+        draw_text_i420(&mut y, &mut u, &mut v, w as usize, h as usize, x, ytop, scale, &ts_text);
+
+        // 本地预览：使用 SDL2 IYUV 纹理（与 I420 顺序一致）
+        if let Some(canvas) = &mut canvas_opt {
+            let y_pitch = w as usize;
+            let uv_pitch = (w / 2) as usize;
+            // 每帧创建纹理，作用域内使用完即丢弃，避免生命周期问题
+            if let Ok(mut tex) = canvas.texture_creator().create_texture_streaming(PixelFormatEnum::IYUV, w, h) {
+                let _ = tex.update_yuv(
+                None,
+                &y, y_pitch,
+                &u, uv_pitch,
+                &v, uv_pitch,
+                );
+                canvas.clear();
+                let _ = canvas.copy(&tex, None, Some(Rect::new(0, 0, w, h)));
+                canvas.present();
+            }
+        }
 
         // 将 I420 平面数据复制到 LiveKit 的 I420Buffer 后提交
         let mut buffer = I420Buffer::new(w, h);

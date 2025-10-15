@@ -20,6 +20,9 @@ livekit = "0.7.18"
 
 # 摄像头采集（/dev/video*）与像素转换
 v4l = "0.14"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+sdl2 = { version = "0.36", default-features = false }
+jpeg-decoder = "0.3"
 
 # ROS2：使用本地工作区路径依赖（构建完成后可用）
 rclrs = { path = "/home/orin64/rust_ws/src/ros2_rust/rclrs" }

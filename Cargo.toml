@@ -18,25 +18,30 @@ urlencoding = "2.1"
 # 升级至最新稳定 livekit 以避免老版本依赖冲突
 livekit = "0.7.18"
 
-# ROS2：使用工作区路径依赖，确保与 ROS 发行版一致
-rclrs = { path = "/home/cyber-v2x/rust_ws/src/ros2_rust/rclrs" }
-# 直接使用已安装工作区中的 sensor_msgs crate（colcon build 产物）
-sensor_msgs = { path = "/home/cyber-v2x/rust_ws/install/sensor_msgs/share/sensor_msgs/rust" }
-# 其依赖的消息包也从安装产物指向，避免 crates.io 解析
-builtin_interfaces = { path = "/home/cyber-v2x/rust_ws/install/builtin_interfaces/share/builtin_interfaces/rust" }
-geometry_msgs = { path = "/home/cyber-v2x/rust_ws/install/geometry_msgs/share/geometry_msgs/rust" }
-std_msgs = { path = "/home/cyber-v2x/rust_ws/install/std_msgs/share/std_msgs/rust" }
-test_msgs = { path = "/home/cyber-v2x/rust_ws/install/test_msgs/share/test_msgs/rust" }
+# 摄像头采集（/dev/video*）与像素转换
+v4l = "0.14"
+
+# ROS2：使用本地工作区路径依赖（构建完成后可用）
+rclrs = { path = "/home/orin64/rust_ws/src/ros2_rust/rclrs" }
+sensor_msgs = { path = "/home/orin64/rust_ws/install/sensor_msgs/share/sensor_msgs/rust" }
+builtin_interfaces = { path = "/home/orin64/rust_ws/install/builtin_interfaces/share/builtin_interfaces/rust" }
+geometry_msgs = { path = "/home/orin64/rust_ws/install/geometry_msgs/share/geometry_msgs/rust" }
+std_msgs = { path = "/home/orin64/rust_ws/install/std_msgs/share/std_msgs/rust" }
+test_msgs = { path = "/home/orin64/rust_ws/install/test_msgs/share/test_msgs/rust" }
 
 [patch.crates-io]
 # 覆盖 crates.io，同名 crate 一律使用本地已安装的工作区产物
-builtin_interfaces = { path = "/home/cyber-v2x/rust_ws/install/builtin_interfaces/share/builtin_interfaces/rust" }
-geometry_msgs = { path = "/home/cyber-v2x/rust_ws/install/geometry_msgs/share/geometry_msgs/rust" }
-std_msgs = { path = "/home/cyber-v2x/rust_ws/install/std_msgs/share/std_msgs/rust" }
-action_msgs = { path = "/home/cyber-v2x/rust_ws/install/action_msgs/share/action_msgs/rust" }
-rcl_interfaces = { path = "/home/cyber-v2x/rust_ws/install/rcl_interfaces/share/rcl_interfaces/rust" }
-example_interfaces = { path = "/home/cyber-v2x/rust_ws/install/example_interfaces/share/example_interfaces/rust" }
-rosgraph_msgs = { path = "/home/cyber-v2x/rust_ws/install/rosgraph_msgs/share/rosgraph_msgs/rust" }
-test_msgs = { path = "/home/cyber-v2x/rust_ws/install/test_msgs/share/test_msgs/rust" }
-unique_identifier_msgs = { path = "/home/cyber-v2x/rust_ws/install/unique_identifier_msgs/share/unique_identifier_msgs/rust" }
+builtin_interfaces = { path = "/home/orin64/rust_ws/install/builtin_interfaces/share/builtin_interfaces/rust" }
+geometry_msgs = { path = "/home/orin64/rust_ws/install/geometry_msgs/share/geometry_msgs/rust" }
+std_msgs = { path = "/home/orin64/rust_ws/install/std_msgs/share/std_msgs/rust" }
+action_msgs = { path = "/home/orin64/rust_ws/install/action_msgs/share/action_msgs/rust" }
+rcl_interfaces = { path = "/home/orin64/rust_ws/install/rcl_interfaces/share/rcl_interfaces/rust" }
+example_interfaces = { path = "/home/orin64/rust_ws/install/example_interfaces/share/example_interfaces/rust" }
+rosgraph_msgs = { path = "/home/orin64/rust_ws/install/rosgraph_msgs/share/rosgraph_msgs/rust" }
+test_msgs = { path = "/home/orin64/rust_ws/install/test_msgs/share/test_msgs/rust" }
+unique_identifier_msgs = { path = "/home/orin64/rust_ws/install/unique_identifier_msgs/share/unique_identifier_msgs/rust" }
+
+[[bin]]
+name = "cam_push"
+path = "src/bin/cam_push.rs"
 

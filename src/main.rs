@@ -30,9 +30,9 @@ static GLOBAL_CONTROL_STATE: std::sync::OnceLock<std::sync::Mutex<UnifiedControl
 // 定义一个统一的帧消息，以便未来扩展（例如，如果也需要处理 RGBA）
 enum FrameMsg {
     I420 {
-        y: Vec<u8>,
-        u: Vec<u8>,
-        v: Vec<u8>,
+        y: Arc<Vec<u8>>,  // 使用Arc避免拷贝
+        u: Arc<Vec<u8>>,  // 使用Arc避免拷贝
+        v: Arc<Vec<u8>>,  // 使用Arc避免拷贝
         width: u32,
         height: u32,
         ts_us: i64,
@@ -132,7 +132,14 @@ fn start_ros2_image_subscriber(tx: mpsc::Sender<FrameMsg>, topic: String) -> std
 
             // 视频帧日志过多，开发阶段关闭此高频打印，如需调试可启用
 
-            if let Err(e) = tx_sub.try_send(FrameMsg::I420 { y, u, v, width, height, ts_us }) {
+            if let Err(e) = tx_sub.try_send(FrameMsg::I420 { 
+                y: Arc::new(y), 
+                u: Arc::new(u), 
+                v: Arc::new(v), 
+                width, 
+                height, 
+                ts_us 
+            }) {
                 println!("⚠️  发送到通道失败(满?): {:?}", e);
             }
         }) {
@@ -319,9 +326,9 @@ fn parse_and_merge_control_message(payload: &str) -> Result<UnifiedControlMessag
 
 /// 将已是 I420 格式的帧平面数据推送到 LiveKit
 async fn push_i420_planes(
-    y_plane: &[u8],
-    u_plane: &[u8],
-    v_plane: &[u8],
+    y_plane: &Arc<Vec<u8>>,
+    u_plane: &Arc<Vec<u8>>,
+    v_plane: &Arc<Vec<u8>>,
     width: u32,
     height: u32,
     timestamp_us: i64,
@@ -336,9 +343,9 @@ async fn push_i420_planes(
     
     // 确保我们的数据能够放入 LiveKit 的 buffer 中
     if y_data.len() == y_plane.len() && u_data.len() == u_plane.len() && v_data.len() == v_plane.len() {
-        y_data.copy_from_slice(y_plane);
-        u_data.copy_from_slice(u_plane);
-        v_data.copy_from_slice(v_plane);
+        y_data.copy_from_slice(y_plane.as_slice());
+        u_data.copy_from_slice(u_plane.as_slice());
+        v_data.copy_from_slice(v_plane.as_slice());
     } else {
         println!(
             "⚠️  平面尺寸不匹配，丢弃帧: dst(Y,U,V)=({},{},{}), src(Y,U,V)=({},{},{}) w={}, h={}",
@@ -434,8 +441,8 @@ async fn main() -> Result<()> {
                 source: TrackSource::Camera, 
                 simulcast: true,  // 启用simulcast多分辨率流
                 video_encoding: Some(VideoEncoding {
-                    max_bitrate: 2_000_000,  // 2Mbps最大码率
-                    max_framerate: 30.0,     // 30fps最大帧率
+                    max_bitrate: 2_000_000,  // 2Mbps最大码率（保持高清）
+                    max_framerate: 20.0,     // 20fps帧率（适合远程操作）
                 }),
                 ..Default::default() 
             }
@@ -448,7 +455,7 @@ async fn main() -> Result<()> {
     let _ = GLOBAL_VIDEO_SOURCE.set(Arc::new(source));
 
     // --- 仅 ROS2 视频源 ---
-    let (tx, mut rx) = mpsc::channel::<FrameMsg>(8);
+    let (tx, mut rx) = mpsc::channel::<FrameMsg>(64);
     let topic = std::env::var("ROS_IMAGE_TOPIC").unwrap_or_else(|_| "/camera_front_wide".to_string());
     println!("🛰️  使用 ROS2 图像话题: {}", topic);
     let _handle = start_ros2_image_subscriber(tx, topic);

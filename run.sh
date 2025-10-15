@@ -11,7 +11,7 @@ echo "🚀 启动 LoadExc_client..."
 
 # 1) 确保 webrtc 预编译包路径（编译期环境变量）
 if [ -z "${LK_CUSTOM_WEBRTC:-}" ]; then
-  export LK_CUSTOM_WEBRTC="$(pwd)/.webrtc/webrtc-linux-x64-release/linux-x64-release"
+  export LK_CUSTOM_WEBRTC="$(pwd)/.webrtc/linux-arm64-release"
 fi
 
 # 2) 仅用于提示：读取 .env 展示关键配置（实际加载在程序内完成）

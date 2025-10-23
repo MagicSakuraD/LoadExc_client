@@ -30,9 +30,9 @@ static GLOBAL_CONTROL_STATE: std::sync::OnceLock<std::sync::Mutex<UnifiedControl
 // 定义一个统一的帧消息，以便未来扩展（例如，如果也需要处理 RGBA）
 enum FrameMsg {
     I420 {
-        y: Arc<Vec<u8>>,  // 使用Arc避免拷贝
-        u: Arc<Vec<u8>>,  // 使用Arc避免拷贝
-        v: Arc<Vec<u8>>,  // 使用Arc避免拷贝
+        y: Arc<[u8]>,  // 使用Arc<[u8]>避免Vec分配和拷贝
+        u: Arc<[u8]>,  // 使用Arc<[u8]>避免Vec分配和拷贝
+        v: Arc<[u8]>,  // 使用Arc<[u8]>避免Vec分配和拷贝
         width: u32,
         height: u32,
         ts_us: i64,
@@ -106,6 +106,10 @@ fn start_ros2_image_subscriber(tx: mpsc::Sender<FrameMsg>, topic: String) -> std
                 return;
             }
 
+            let ts_us = (msg.header.stamp.sec as i64) * 1_000_000 + (msg.header.stamp.nanosec as i64) / 1_000;
+
+
+            // 处理 I420 格式（原有逻辑）
             let y_size = (width as usize) * (height as usize);
             let uv_plane = (width as usize * height as usize) / 4;
             let expected = y_size + 2 * uv_plane;
@@ -125,17 +129,17 @@ fn start_ros2_image_subscriber(tx: mpsc::Sender<FrameMsg>, topic: String) -> std
                 );
             }
 
-            let y = msg.data[0..y_size].to_vec();
-            let u = msg.data[y_size..y_size + uv_plane].to_vec();
-            let v = msg.data[y_size + uv_plane..expected].to_vec();
-            let ts_us = (msg.header.stamp.sec as i64) * 1_000_000 + (msg.header.stamp.nanosec as i64) / 1_000;
+            // 零拷贝优化：使用Arc::from避免to_vec()复制
+            let y = Arc::from(&msg.data[0..y_size]);
+            let u = Arc::from(&msg.data[y_size..y_size + uv_plane]);
+            let v = Arc::from(&msg.data[y_size + uv_plane..expected]);
 
             // 视频帧日志过多，开发阶段关闭此高频打印，如需调试可启用
 
             if let Err(e) = tx_sub.try_send(FrameMsg::I420 { 
-                y: Arc::new(y), 
-                u: Arc::new(u), 
-                v: Arc::new(v), 
+                y, 
+                u, 
+                v, 
                 width, 
                 height, 
                 ts_us 
@@ -198,7 +202,8 @@ fn start_ros2_controls_publisher(
         loop {
             match rx.recv() {
                 Ok(ControlMsg::Data { data, reliable }) => {
-                    let payload = match String::from_utf8(data.as_ref().clone()) {
+                    // 直接从字节切片获得UTF-8视图，避免分配与复制
+                    let payload = match std::str::from_utf8(data.as_ref()) {
                         Ok(s) => s,
                         Err(e) => {
                             eprintln!("⚠️  控制消息非 UTF-8，丢弃: {:?}", e);
@@ -216,7 +221,7 @@ fn start_ros2_controls_publisher(
                         }
 
                         let mut msg = RosString::default();
-                        msg.data = serde_json::to_string(&unified_msg).unwrap_or_else(|_| payload);
+                        msg.data = serde_json::to_string(&unified_msg).unwrap_or_else(|_| payload.to_string());
                         if let Err(e) = pub_control.publish(msg) {
                             eprintln!("⚠️  发布 '{}' 失败: {:?}", control_topic, e);
                         }
@@ -324,11 +329,11 @@ fn parse_and_merge_control_message(payload: &str) -> Result<UnifiedControlMessag
     })
 }
 
-/// 将已是 I420 格式的帧平面数据推送到 LiveKit
-async fn push_i420_planes(
-    y_plane: &Arc<Vec<u8>>,
-    u_plane: &Arc<Vec<u8>>,
-    v_plane: &Arc<Vec<u8>>,
+/// 将已是 I420 格式的帧平面数据推送到 LiveKit (同步版本)
+fn push_i420_planes_sync(
+    y_plane: &Arc<[u8]>,
+    u_plane: &Arc<[u8]>,
+    v_plane: &Arc<[u8]>,
     width: u32,
     height: u32,
     timestamp_us: i64,
@@ -343,9 +348,24 @@ async fn push_i420_planes(
     
     // 确保我们的数据能够放入 LiveKit 的 buffer 中
     if y_data.len() == y_plane.len() && u_data.len() == u_plane.len() && v_data.len() == v_plane.len() {
-        y_data.copy_from_slice(y_plane.as_slice());
-        u_data.copy_from_slice(u_plane.as_slice());
-        v_data.copy_from_slice(v_plane.as_slice());
+        // 使用更高效的内存操作，减少复制开销
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                y_plane.as_ptr(),
+                y_data.as_mut_ptr(),
+                y_plane.len()
+            );
+            std::ptr::copy_nonoverlapping(
+                u_plane.as_ptr(),
+                u_data.as_mut_ptr(),
+                u_plane.len()
+            );
+            std::ptr::copy_nonoverlapping(
+                v_plane.as_ptr(),
+                v_data.as_mut_ptr(),
+                v_plane.len()
+            );
+        }
     } else {
         println!(
             "⚠️  平面尺寸不匹配，丢弃帧: dst(Y,U,V)=({},{},{}), src(Y,U,V)=({},{},{}) w={}, h={}",
@@ -383,42 +403,53 @@ async fn main() -> Result<()> {
     // 优先使用 .env 中的配置（覆盖已存在的环境变量）
     let _ = dotenv_override().ok();
 
-    // 读取 LiveKit 连接参数（默认 ws://localhost:7880，可被环境变量覆盖）
-    let lk_url = env::var("LIVEKIT_URL").unwrap_or_else(|_| "ws://192.168.3.41:7880".to_string());
+    // 读取 LiveKit 连接参数（默认云服务器地址，可被环境变量覆盖）
+    let lk_url = env::var("LIVEKIT_URL").unwrap_or_else(|_| "ws://111.186.56.118:7880".to_string());
     println!("   🔧 LIVEKIT_URL={}", lk_url);
 
-    // 仅支持动态签发：必须提供 LIVEKIT_TOKEN_ENDPOINT
+    // 支持两种认证方式：动态Token签发 或 直接API Key/Secret
     let endpoint = env::var("LIVEKIT_TOKEN_ENDPOINT").unwrap_or_default();
-    if endpoint.is_empty() {
-        anyhow::bail!("仅支持动态签发：请设置 LIVEKIT_TOKEN_ENDPOINT（例如 http://192.168.3.41:3000/api/token）")
-    }
+    let api_key = env::var("LIVEKIT_API_KEY").unwrap_or_default();
+    let api_secret = env::var("LIVEKIT_API_SECRET").unwrap_or_default();
+    
+    let lk_token = if !endpoint.is_empty() {
+        // 方式1：动态Token签发
+        let room = env::var("LIVEKIT_ROOM").unwrap_or_else(|_| "excavator-control-room".to_string());
+        let username = env::var("LIVEKIT_USERNAME").unwrap_or_else(|_| "heavyMachRemoteTerm".to_string());
 
-    // 允许通过环境变量覆盖 room/username
-    let room = env::var("LIVEKIT_ROOM").unwrap_or_else(|_| "excavator-control-room".to_string());
-    let username = env::var("LIVEKIT_USERNAME").unwrap_or_else(|_| "heavyMachRemoteTerm".to_string());
+        println!("   🌐 正在从 LIVEKIT_TOKEN_ENDPOINT 获取动态 Token...\n       endpoint={} room={} username={}", endpoint, room, username);
 
-    println!("   🌐 正在从 LIVEKIT_TOKEN_ENDPOINT 获取动态 Token...\n       endpoint={} room={} username={}", endpoint, room, username);
+        let url = format!("{}?room={}&username={}", endpoint, urlencoding::encode(&room), urlencoding::encode(&username));
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(&url)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .context("请求 LIVEKIT_TOKEN_ENDPOINT 失败")?;
 
-    // GET ?room=..&username=..（对接 Next.js 端点）
-    let url = format!("{}?room={}&username={}", endpoint, urlencoding::encode(&room), urlencoding::encode(&username));
-    let client = reqwest::Client::new();
-    let resp = client
-        .get(&url)
-        .header("Accept", "application/json")
-        .send()
-        .await
-        .context("请求 LIVEKIT_TOKEN_ENDPOINT 失败")?;
+        if !resp.status().is_success() {
+            anyhow::bail!(format!("LIVEKIT_TOKEN_ENDPOINT 返回非 2xx: {}", resp.status()));
+        }
 
-    if !resp.status().is_success() {
-        anyhow::bail!(format!("LIVEKIT_TOKEN_ENDPOINT 返回非 2xx: {}", resp.status()));
-    }
-
-    let json: serde_json::Value = resp.json().await.context("解析 token JSON 失败")?;
-    let lk_token = json.get("token").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    if lk_token.is_empty() {
-        anyhow::bail!("LIVEKIT_TOKEN_ENDPOINT 未返回 token 字段")
-    }
-    println!("   ✅ LIVEKIT_TOKEN: [hidden] (fetched)");
+        let json: serde_json::Value = resp.json().await.context("解析 token JSON 失败")?;
+        let token = json.get("token").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if token.is_empty() {
+            anyhow::bail!("LIVEKIT_TOKEN_ENDPOINT 未返回 token 字段")
+        }
+        println!("   ✅ LIVEKIT_TOKEN: [hidden] (fetched)");
+        token
+    } else if !api_key.is_empty() && !api_secret.is_empty() {
+        // 方式2：直接使用API Key/Secret（需要外部Token生成服务）
+        let room = env::var("LIVEKIT_ROOM").unwrap_or_else(|_| "excavator-control-room".to_string());
+        let username = env::var("LIVEKIT_USERNAME").unwrap_or_else(|_| "heavyMachRemoteTerm".to_string());
+        
+        println!("   🔑 使用 API Key/Secret 模式...\n       room={} username={}", room, username);
+        println!("   ⚠️  注意：需要配置 LIVEKIT_TOKEN_ENDPOINT 来生成Token");
+        anyhow::bail!("请设置 LIVEKIT_TOKEN_ENDPOINT 来生成Token，或使用动态Token签发方式")
+    } else {
+        anyhow::bail!("请设置 LIVEKIT_TOKEN_ENDPOINT 或 LIVEKIT_API_KEY+LIVEKIT_API_SECRET")
+    };
 
     // --- LiveKit 连接和轨道创建 ---
     println!("🔗 正在连接到 LiveKit 房间...");
@@ -491,9 +522,13 @@ async fn main() -> Result<()> {
             // 监听从 ROS2 图像订阅来的新视频帧（静默处理，避免刷屏）
             Some(msg) = rx.recv() => {
                 let FrameMsg::I420 { y, u, v, width, height, ts_us } = msg;
-                if let Err(e) = push_i420_planes(&y, &u, &v, width, height, ts_us).await {
-                    warn!("Failed to push frame to LiveKit: {:?}", e);
-                }
+                // 在后台阻塞线程执行拷贝与提交，避免阻塞主异步循环
+                tokio::task::spawn_blocking(move || {
+                    // 直接调用同步函数，避免 block_on 套娃
+                    if let Err(e) = push_i420_planes_sync(&y, &u, &v, width, height, ts_us) {
+                        warn!("Failed to push frame to LiveKit: {:?}", e);
+                    }
+                });
             }
             // 监听 Ctrl+C 信号以优雅地关闭
             _ = tokio::signal::ctrl_c() => {

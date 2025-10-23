@@ -2,6 +2,7 @@
 name = "LoadExc_client"
 version = "0.1.0"
 edition = "2024"
+default-run = "LoadExc_client"
 
 [dependencies]
 anyhow = "1"
@@ -18,11 +19,6 @@ urlencoding = "2.1"
 # 升级至最新稳定 livekit 以避免老版本依赖冲突
 livekit = "0.7.18"
 
-# 摄像头采集（/dev/video*）与像素转换
-v4l = "0.14"
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
-sdl2 = { version = "0.36", default-features = false }
-jpeg-decoder = "0.3"
 
 # ROS2：使用本地工作区路径依赖（构建完成后可用）
 rclrs = { path = "/home/orin64/rust_ws/src/ros2_rust/rclrs" }
@@ -41,10 +37,7 @@ action_msgs = { path = "/home/orin64/rust_ws/install/action_msgs/share/action_ms
 rcl_interfaces = { path = "/home/orin64/rust_ws/install/rcl_interfaces/share/rcl_interfaces/rust" }
 example_interfaces = { path = "/home/orin64/rust_ws/install/example_interfaces/share/example_interfaces/rust" }
 rosgraph_msgs = { path = "/home/orin64/rust_ws/install/rosgraph_msgs/share/rosgraph_msgs/rust" }
-test_msgs = { path = "/home/orin64/rust_ws/install/test_msgs/share/test_msgs/rust" }
 unique_identifier_msgs = { path = "/home/orin64/rust_ws/install/unique_identifier_msgs/share/unique_identifier_msgs/rust" }
+test_msgs = { path = "/home/orin64/rust_ws/install/test_msgs/share/test_msgs/rust" }
 
-[[bin]]
-name = "cam_push"
-path = "src/bin/cam_push.rs"
 

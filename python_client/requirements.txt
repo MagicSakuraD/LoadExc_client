@@ -1,0 +1,5 @@
+opencv-python>=4.8.0
+numpy>=1.24.0
+rclpy>=3.3.0
+sensor-msgs>=4.2.0
+std-msgs>=4.2.0

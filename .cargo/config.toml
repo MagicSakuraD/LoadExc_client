@@ -1,4 +1,4 @@
-[build]
-rustflags = ["-C", "link-arg=-Wl,-rpath,$ORIGIN"]
-
-
+[env]
+CC = "clang"
+CXX = "clang++"
+LK_CUSTOM_WEBRTC = "/home/orin64/MyCode/LoadExc_client/.webrtc/linux-arm64-release"

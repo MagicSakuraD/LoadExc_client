@@ -1,0 +1,29 @@
+[package]
+name = "LoadExc_ros2_client"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ros2_simple"
+path = "src/ros2_simple.rs"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# ROS2 依赖
+rclrs = { path = "/home/orin64/rust_ws/src/ros2_rust/rclrs" }
+sensor_msgs = { path = "/home/orin64/rust_ws/install/sensor_msgs/share/sensor_msgs/rust" }
+builtin_interfaces = { path = "/home/orin64/rust_ws/install/builtin_interfaces/share/builtin_interfaces/rust" }
+std_msgs = { path = "/home/orin64/rust_ws/install/std_msgs/share/std_msgs/rust" }
+
+[patch.crates-io]
+builtin_interfaces = { path = "/home/orin64/rust_ws/install/builtin_interfaces/share/builtin_interfaces/rust" }
+std_msgs = { path = "/home/orin64/rust_ws/install/std_msgs/share/std_msgs/rust" }
+
+
+
+
+
+

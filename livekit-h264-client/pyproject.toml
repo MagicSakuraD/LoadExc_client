@@ -1,0 +1,13 @@
+[project]
+name = "livekit-h264-client"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "asyncio>=4.0.0",
+    "livekit>=1.0.17",
+    "numpy>=2.2.6",
+    "opencv-python>=4.11.0.86",
+    "requests>=2.32.5",
+]
